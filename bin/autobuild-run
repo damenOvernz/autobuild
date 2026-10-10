@@ -1,0 +1,263 @@
+#!/usr/bin/env bash
+# Builds one project unattended with Claude Code, in rounds, until:
+#   DONE           -> finished (report saved to Drive, phone ping)
+#   NEEDS_DAMEN.md -> a decision only Damen can make (question saved to Drive, phone ping)
+#   round limit    -> stops and pings
+#
+# Two kinds of project:
+#   NEW       - PLAN.md has no "repo:" line. Built from scratch in the project folder.
+#   EXISTING  - PLAN.md starts with a header like:
+#                   repo: https://github.com/you/promie      (GitHub)
+#                   repo: /home/damen/projects/promie        (folder on this server, shared with "autobuild share")
+#                   base: main                               (optional: branch to start from)
+#               The code is copied into <project>/code and Claude Code works ONLY on its own
+#               branch (autobuild/<name>). GitHub: that branch is pushed. Server folder: run
+#               "autobuild bring <name>" to pull the branch into your own copy. Nothing is ever merged.
+set -uo pipefail
+source "$(dirname "$0")/ab-common.sh"
+
+slug="$1"
+dir="$AB_PROJECTS/$slug"
+meta="$dir/.autobuild"
+mkdir -p "$meta" "$AB_OUT"
+cd "$dir" || exit 1
+echo $$ > "$meta/pid"
+ab_set_state "$slug" running
+act() { echo "[$(date +%H:%M:%S)] $*" >> "$meta/activity.log"; }
+act "🚀 Build started"
+
+need_damen() { # stop and ask Damen (plain English), used for setup problems
+  printf '%s\n' "$1" > "$meta/NEEDS_DAMEN.md"
+  ab_set_state "$slug" waiting
+  act "✋ Paused - needs Damen's answer (see NEEDS_DAMEN.md)"
+  ab_sync_out "$slug"
+  ab_notify "AutoBuild: $slug needs you" "$2" high
+  rm -f "$meta/pid"; exit 0
+}
+
+# ---------- Read the plan header ----------
+plan_field() {
+  # tolerant: accepts "repo: x", "### repo: x", "- **repo:** x", "> repo: x"
+  sed -n '1,40p' "$dir/PLAN.md" | tr -d '\r' | sed -E 's/\*\*//g' \
+    | grep -m1 -iE "^[[:space:]#>*_\`-]*$1:[[:space:]]*[^[:space:]]" \
+    | sed -E "s/^[[:space:]#>*_\`-]*$1:[[:space:]]*//I; s/[[:space:]]+#.*$//; s/^[\"'\`<]//; s/[\"'\`>][[:space:]]*$//"
+}
+repo=$(plan_field repo)
+base=$(plan_field base)
+branch=$(plan_field branch)
+[ -z "$branch" ] && branch="autobuild/$slug"
+case "$branch" in main|master|develop|dev|production|prod|release|staging) branch="autobuild/$slug" ;; esac
+
+if [ -z "$repo" ] && [ -n "$base" ] && [ ! -f "$meta/kind" ]; then
+  need_damen "# The plan looks like it's for an existing project, but I can't find its repo line
+
+It names a base branch ($base) but no **repo:** line, so I don't know which code to work on.
+I haven't started, so nothing has changed.
+
+**To fix:** ask ChatGPT to re-save the plan with these as the very first lines:
+
+    ---
+    repo: <GitHub address or server folder>
+    base: $base
+    ---" "The plan has no repo: line. Ask ChatGPT to re-save it with repo: at the top."
+fi
+if [ -n "$repo" ]; then
+  kind="existing"; work="$dir/code"; P="$dir/PLAN.md"; M="$meta"
+else
+  kind="new"; work="$dir"; P="PLAN.md"; M=".autobuild"
+fi
+echo "$kind" > "$meta/kind"
+
+# ---------- Get the code (existing projects) ----------
+if [ "$kind" = "existing" ] && [ ! -d "$work/.git" ]; then
+  src="$repo"; where="GitHub"
+  case "$repo" in
+    /*|~*)  # a folder on this server: use the read-only copy made by "autobuild share"
+      where="server folder"
+      src=$(grep -lxF "$repo" "$AB_IN"/*.path 2>/dev/null | head -n1); src="${src%.path}.git"
+      if [ ! -d "$src" ]; then
+        need_damen "# I can't see that project folder yet
+
+The plan says to work on **$repo**, but that folder hasn't been shared with AutoBuild.
+
+**To fix (one time):** on the server, run:
+
+    autobuild share $repo
+
+Then save an empty **answer.md** in this Drive folder and I'll carry on." \
+          "Can't see $repo yet. Run: autobuild share $repo  - then save answer.md in Drive."
+      fi ;;
+    *) case "$repo" in *://*|git@*) ;; *) src="https://github.com/${repo#github.com/}" ;; esac ;;
+  esac
+  act "📥 Getting the code from $where"
+  if ! git clone -q "$src" "$work" >> "$meta/git.log" 2>&1; then
+    need_damen "# I couldn't download the code
+
+The plan points at **$repo** ($where) but I couldn't download it.
+
+**Most likely fix:**
+- GitHub: AutoBuild needs permission. On the server run \`autobuild github-login\` and paste a GitHub token
+  that can read and write this repo. Also check the repo address in the plan is right.
+- Server folder: run \`autobuild share $repo\` on the server.
+
+Then save an empty **answer.md** in this Drive folder and I'll try again.
+
+Technical detail: $(tail -n 3 "$meta/git.log" | tr '\n' ' ')" \
+      "Couldn't download $repo. Check NEEDS_DAMEN.md in Drive."
+  fi
+  cd "$work" || exit 1
+  [ -n "$base" ] && git checkout -q "$base" >> "$meta/git.log" 2>&1
+  if ! git rev-parse -q --verify HEAD >/dev/null; then   # no default branch: pick main/master/first
+    for b in main master $(git for-each-ref --format='%(refname:lstrip=3)' refs/remotes/origin | grep -v '^HEAD$'); do
+      git checkout -q "$b" >> "$meta/git.log" 2>&1 && break
+    done
+  fi
+  if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+    git checkout -q -B "$branch" "origin/$branch"      # continue earlier AutoBuild work
+  else
+    git checkout -q -b "$branch"
+  fi
+  # Guard: refuse any push except AutoBuild's own branch, and only when the runner allows it
+  cat > .git/hooks/pre-push <<EOH
+#!/bin/sh
+[ "\$AB_ALLOW_PUSH" = "1" ] || { echo "AutoBuild: pushing is done by the runner only" >&2; exit 1; }
+while read l_ref l_sha r_ref r_sha; do
+  [ "\$r_ref" = "refs/heads/$branch" ] || { echo "AutoBuild: refusing to push \$r_ref" >&2; exit 1; }
+done
+EOH
+  chmod +x .git/hooks/pre-push
+  printf 'kind=%s\nrepo=%s\nbranch=%s\n' "$kind" "$repo" "$branch" > "$AB_OUT/$slug.info"
+  act "🌿 Working on branch $branch (your main code is untouched)"
+  cd "$dir" || exit 1
+elif [ "$kind" = "new" ]; then
+  [ -d .git ] || { git init -q && git add -A && git commit -qm "AutoBuild: plan received" >/dev/null 2>&1 || true; }
+  printf 'kind=new\nbranch=%s\n' "$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null)" > "$AB_OUT/$slug.info"
+fi
+touch "$meta/status.md" "$meta/decisions.md" "$meta/gpt-questions.md"
+[ -f "$meta/phase-start-sha" ] || git -C "$work" rev-parse HEAD > "$meta/phase-start-sha" 2>/dev/null
+[ -f "$meta/phase" ] || echo 1 > "$meta/phase"
+
+rules=$(sed -e "s#{{PLAN}}#$P#g" -e "s#{{META}}#$M#g" "$AB_HOME/templates/BUILD-RULES.md")
+if [ "$kind" = "existing" ]; then
+  rules="$rules
+
+$(sed -e "s#{{PLAN}}#$P#g" -e "s#{{META}}#$M#g" -e "s#{{BRANCH}}#$branch#g" "$AB_HOME/templates/EXISTING-RULES.md")"
+fi
+export AB_PROJECT_DIR="$dir"
+
+# Save the work where Damen can get it (and push the branch for GitHub projects)
+hand_back() {
+  git -C "$work" add -A >/dev/null 2>&1 && git -C "$work" commit -qm "AutoBuild: end of round $round" >/dev/null 2>&1 || true
+  if [ "$kind" = "existing" ]; then
+    case "$repo" in
+      /*|~*) git -C "$work" bundle create "$AB_OUT/$slug.bundle" "$branch" >/dev/null 2>&1 ;;
+      *) AB_ALLOW_PUSH=1 git -C "$work" push -q -u origin "$branch" >> "$meta/git.log" 2>&1 \
+           && act "⬆️ Pushed branch $branch to GitHub" \
+           || act "⚠️ Couldn't push to GitHub (see git.log) - the work is safe on the server" ;;
+    esac
+  else
+    git -C "$work" bundle create "$AB_OUT/$slug.bundle" --all >/dev/null 2>&1
+  fi
+}
+
+# ---------- Work out what this run is for ----------
+if [ "$kind" = "existing" ]; then
+  first_prompt="Read $P, then get to know the existing code in this folder before changing anything. Then work through the plan. Follow the AutoBuild rules exactly."
+else
+  first_prompt="Read $P and start building the MVP. Follow the AutoBuild rules exactly."
+fi
+if [ -f "$meta/answer.md" ]; then
+  first_prompt="Damen has answered the question in $M/NEEDS_DAMEN.md. His answer:
+
+$(cat "$meta/answer.md")
+
+Record his decision in $M/decisions.md, then continue. Start by reading $M/status.md. Follow the AutoBuild rules exactly."
+  mv "$meta/NEEDS_DAMEN.md" "$meta/answered-question-$(date +%Y%m%d-%H%M%S).md" 2>/dev/null || true
+  rm -f "$meta/answer.md"
+  ab_notify "AutoBuild: $slug" "Got your answer - building again."
+elif [ "$(cat "$meta/mode" 2>/dev/null)" = "next-phase" ]; then
+  first_prompt="This is phase $(cat "$meta/phase") of this project. GPT reviewed the previous phase and wrote the new plan in $P. Earlier plans and reports are in $M/PLAN-phase-*.md and $M/REPORT-phase-*.md, and $M/reviews.md has GPT's review. Read $P and $M/status.md, then carry out the new plan. Write a fresh $M/REPORT.md for this phase when done. Follow the AutoBuild rules exactly."
+  rm -f "$meta/mode"
+elif [ "$(cat "$meta/mode" 2>/dev/null)" = "updated-plan" ]; then
+  echo 1 > "$meta/phase"; rm -f "$meta"/phase-*-commits      # Damen's own plan restarts the phase count
+  git -C "$work" rev-parse HEAD > "$meta/phase-start-sha" 2>/dev/null
+  first_prompt="$P has been updated by Damen (previous versions are in $M/PLAN-previous-*.md). Read $M/status.md, compare the new plan with what is done, and carry on to the new plan. Follow the AutoBuild rules exactly."
+  rm -f "$meta/mode"
+  ab_notify "AutoBuild: $slug" "Updated plan received - continuing."
+else
+  ab_notify "AutoBuild: $slug" "New plan received - work has started. I'll ping you when it's done or if I need you."
+fi
+ab_sync_out "$slug"
+
+cd "$work" || exit 1
+round=0
+while [ "$round" -lt "$AB_MAX_ROUNDS" ]; do
+  round=$((round + 1))
+  if [ "$round" -eq 1 ]; then prompt="$first_prompt"; else
+    prompt="Continue. Start by reading $M/status.md and $M/decisions.md to see where you are. Follow the AutoBuild rules exactly."
+  fi
+  ab_log "Round $round starting"
+  act "🔁 Round $round of $AB_MAX_ROUNDS"
+  ( while sleep 60; do ab_sync_out "$slug"; done ) &   # progress to Drive every minute
+  syncer=$!
+  nice -n 10 claude -p "$prompt" \
+    --append-system-prompt "$rules" \
+    --add-dir "$dir" \
+    --dangerously-skip-permissions \
+    --max-turns "$AB_MAX_TURNS" \
+    --output-format stream-json --verbose 2>&1 \
+    | tee -a "$meta/claude-output.log" \
+    | python3 "$AB_HOME/bin/ab-activity" >> "$meta/activity.log" 2>/dev/null
+  rc=${PIPESTATUS[0]}
+  kill "$syncer" 2>/dev/null; wait "$syncer" 2>/dev/null
+  ab_log "Round $round finished (exit $rc)"
+  hand_back
+  ab_docker_cleanup
+  ab_sync_out "$slug"
+
+  if [ -f "$meta/DONE" ]; then
+    act "✅ Phase $(cat "$meta/phase" 2>/dev/null || echo 1) finished - report is ready"
+    ab_sync_out "$slug"
+    if bash "$AB_HOME/bin/ab-next" "$slug"; then      # GPT wrote the next plan: keep going
+      ab_sync_out "$slug"
+      exec "$AB_HOME/bin/autobuild-run" "$slug"
+    fi
+    ab_set_state "$slug" "done"
+    ab_sync_out "$slug"
+    why=$(sed -n '3,4p' "$meta/NEXT-STEPS.md" 2>/dev/null | tr '\n' ' ' | cut -c1-220)
+    if [ "$kind" = "existing" ]; then
+      case "$repo" in
+        /*|~*) msg="Done. To get the work: run  autobuild bring $slug  on the server, then review branch $branch." ;;
+        *) msg="Done. Review branch $branch on GitHub - nothing was merged." ;;
+      esac
+    else msg="MVP finished. Read REPORT.md in Google Drive > AutoBuild > projects > $slug"; fi
+    [ -n "$why" ] && msg="$msg  Next: $why (see NEXT-STEPS.md)"
+    ab_notify "AutoBuild: $slug is ready" "$msg" high
+    rm -f "$meta/pid"; exit 0
+  fi
+  if [ -f "$meta/NEEDS_DAMEN.md" ]; then
+    ab_set_state "$slug" waiting
+    act "✋ Paused - needs Damen's answer (see NEEDS_DAMEN.md)"
+    ab_sync_out "$slug"
+    ab_notify "AutoBuild: $slug needs you" "Question in Drive > AutoBuild > projects > $slug > NEEDS_DAMEN.md. Reply by saving answer.md in that same folder." high
+    rm -f "$meta/pid"; exit 0
+  fi
+  if [ "$rc" -ne 0 ]; then   # Claude Code itself failed (e.g. usage limit): wait before trying again
+    if grep -qiE "usage limit|rate limit|limit reached|overloaded" <(tail -n 20 "$meta/claude-output.log"); then
+      ab_log "Usage limit hit - waiting 30 minutes"
+      act "⏸️ Claude usage limit reached - waiting 30 minutes"
+      ab_sync_out "$slug"
+      sleep 1800
+      pauses=$(( ${pauses:-0} + 1 ))
+      [ "$pauses" -le 16 ] && round=$((round - 1))   # don't count limit pauses (up to 8 hours)
+    else
+      sleep 60
+    fi
+  fi
+done
+
+act "⛔ Stopped - used all $AB_MAX_ROUNDS work rounds"
+ab_set_state "$slug" waiting
+ab_sync_out "$slug"
+ab_notify "AutoBuild: $slug stopped" "Used all $AB_MAX_ROUNDS work rounds without finishing. Check status.md in Drive. Save answer.md in the project folder to tell it what to do next." high
+rm -f "$meta/pid"

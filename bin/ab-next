@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# Auto-next: after a phase finishes, GPT (the architect, via Damen's ChatGPT subscription, read-only)
+# reviews what was done and either writes the next plan or stops.
+#   exit 0 -> a new plan is ready; the runner starts the next phase straight away
+#   exit 1 -> stop here; the reason is in .autobuild/NEXT-STEPS.md and the runner pings Damen
+set -uo pipefail
+source "$(dirname "$0")/ab-common.sh"
+
+slug="$1"
+dir="$AB_PROJECTS/$slug"
+meta="$dir/.autobuild"
+work="$dir"; [ -d "$dir/code/.git" ] && work="$dir/code"
+act() { echo "[$(date +%H:%M:%S)] $*" >> "$meta/activity.log"; }
+stop_with() { # plain-English reason for Damen
+  { echo "# Stopped after phase $phase - what happens next is up to you"; echo; echo "$1"; } > "$meta/NEXT-STEPS.md"
+  act "⏹️ Auto-next stopped: $(echo "$1" | head -n1 | cut -c1-140)"
+  exit 1
+}
+
+field() { # same tolerant header reader as the runner
+  sed -n '1,40p' "$dir/PLAN.md" | tr -d '\r' | sed -E 's/\*\*//g' \
+    | grep -m1 -iE "^[[:space:]#>*_\`-]*$1:[[:space:]]*[^[:space:]]" \
+    | sed -E "s/^[[:space:]#>*_\`-]*$1:[[:space:]]*//I; s/[[:space:]]+#.*$//; s/^[\"'\`<]//; s/[\"'\`>][[:space:]]*$//"
+}
+
+phase=$(cat "$meta/phase" 2>/dev/null || echo 1)
+max=$(field phases); max="${max:-${AB_MAX_PHASES:-3}}"
+case "$(field auto-next | tr '[:upper:]' '[:lower:]')" in off|no|false|0) stop_with "Auto-next is turned off in this plan." ;; esac
+[ "${AB_AUTO_NEXT:-1}" = "1" ] || stop_with "Auto-next is turned off on the server."
+[ "$phase" -ge "$max" ] && stop_with "Reached the limit of $max automatic phases. Review the work, then send the next plan from ChatGPT to keep going."
+
+# ---------- No-progress guard: two phases in a row with no new commits = stuck ----------
+start=$(cat "$meta/phase-start-sha" 2>/dev/null || true)
+commits=0
+[ -n "$start" ] && commits=$(git -C "$work" rev-list --count "$start..HEAD" 2>/dev/null || echo 0)
+echo "$commits" > "$meta/phase-$phase-commits"
+prev=$(cat "$meta/phase-$((phase - 1))-commits" 2>/dev/null || echo 1)
+if [ "$commits" -eq 0 ] && [ "$prev" -eq 0 ]; then
+  stop_with "Two phases in a row finished without changing any code, so it looks stuck on something it can't fix itself.
+Check REPORT.md for the blocker (often something only you can provide, like Docker, a password or a decision)."
+fi
+
+# ---------- Ask GPT to review and decide ----------
+act "🧠 GPT is reviewing phase $phase and deciding the next step"
+log=$(git -C "$work" log --oneline -25 2>/dev/null)
+stat=$( [ -n "$start" ] && git -C "$work" diff --stat "$start..HEAD" 2>/dev/null | tail -n 40)
+prompt="You are the architect and reviewer for this project. Damen is not technical and is NOT available.
+A builder (Claude Code) has just finished phase $phase of $max. Review the evidence and decide what happens next.
+
+=== PLAN FOR THE PHASE JUST FINISHED ===
+$(cat "$dir/PLAN.md")
+
+=== BUILDER'S FINAL REPORT ===
+$(cat "$meta/REPORT.md" 2>/dev/null || echo '(no report)')
+
+=== STATUS / DECISIONS ===
+$(tail -c 4000 "$meta/status.md" 2>/dev/null)
+$(tail -c 4000 "$meta/decisions.md" 2>/dev/null)
+
+=== GIT: recent commits / changes this phase ===
+$log
+$stat
+
+You may read the code in this folder to check the report's claims. Do NOT change anything.
+
+Choose ONE:
+
+STOP if any of these are true:
+- the report says the work is complete / ready for owner approval / ready to merge, and nothing useful remains;
+- the next step needs anything only Damen can do or approve: real model/LLM calls, deploying, merging,
+  production systems, real data, passwords/credentials, spending money, billing, new accounts,
+  or tools the builder reports it cannot use here (e.g. CI, or Docker if unavailable) - list exactly what Damen must do;
+- the plan's own boundaries say to stop at this point;
+- you are not confident the next step is right.
+
+CONTINUE only if there is clear, useful, in-scope work the builder can do on its own next.
+
+Reply in EXACTLY this format:
+DECISION: CONTINUE or DECISION: STOP
+SUMMARY: <2-4 plain-English sentences for Damen: what was done, and why you chose this>
+If STOP:
+WHAT DAMEN NEEDS TO DO:
+- <action 1>
+- <action 2>
+If CONTINUE:
+---PLAN---
+# <short title for the next phase>
+## Goal
+## Tasks (numbered, specific)
+## Definition of done
+## Boundaries (copy every boundary from the current plan; never loosen them)"
+
+out=$(mktemp)
+timeout "${AB_GPT_TIMEOUT:-600}" codex exec --sandbox read-only --skip-git-repo-check -C "$work" -o "$out" "$prompt" >> "$meta/codex.log" 2>&1
+reply=$(cat "$out" 2>/dev/null); rm -f "$out"
+{ echo "## $(date '+%Y-%m-%d %H:%M') - Review of phase $phase"; echo; echo "$reply"; echo; } >> "$meta/reviews.md"
+
+decision=$(printf '%s\n' "$reply" | grep -m1 -oiE 'DECISION:[[:space:]]*(CONTINUE|STOP)' | grep -oiE 'CONTINUE|STOP' | tr '[:lower:]' '[:upper:]')
+summary=$(printf '%s\n' "$reply" | sed -n '/^SUMMARY:/,/^\(WHAT DAMEN\|---PLAN---\)/p' | sed '$d' | sed 's/^SUMMARY:[[:space:]]*//')
+[ -z "$reply" ] && stop_with "GPT didn't answer (it may have hit the ChatGPT usage limit). Review the report and send the next plan from ChatGPT."
+if [ "$decision" != "CONTINUE" ]; then
+  stop_with "$( [ -n "$summary" ] && echo "$summary" || echo "GPT recommends stopping here.")
+
+$(printf '%s\n' "$reply" | sed -n '/^WHAT DAMEN NEEDS TO DO:/,$p')"
+fi
+plan_body=$(printf '%s\n' "$reply" | sed -n '/^---PLAN---/,$p' | sed '1d')
+[ -z "$(echo "$plan_body" | tr -d '[:space:]')" ] && stop_with "GPT said continue but didn't write a plan. Review and send the next plan from ChatGPT."
+
+# ---------- Set up the next phase ----------
+header=""
+for k in repo base branch phases; do v=$(field "$k"); [ -n "$v" ] && header="$header$k: $v
+"; done
+mv "$dir/PLAN.md" "$meta/PLAN-phase-$phase.md"
+mv "$meta/REPORT.md" "$meta/REPORT-phase-$phase.md" 2>/dev/null
+{ [ -n "$header" ] && printf -- '---\n%s---\n\n' "$header"; printf '%s\n' "$plan_body"; } > "$dir/PLAN.md"
+rm -f "$meta/DONE" "$meta/gpt-count" "$meta/NEXT-STEPS.md"
+git -C "$work" rev-parse HEAD > "$meta/phase-start-sha" 2>/dev/null
+echo $((phase + 1)) > "$meta/phase"
+echo "next-phase" > "$meta/mode"
+title=$(printf '%s\n' "$plan_body" | grep -m1 '^#' | sed 's/^#*[[:space:]]*//')
+act "📋 Phase $((phase + 1)) planned by GPT: ${title:-next steps}"
+ab_notify "AutoBuild: $slug - phase $((phase + 1)) started" "${title:-Next steps} (phase $((phase + 1)) of $max). ${summary:0:200}"
+exit 0
