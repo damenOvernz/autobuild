@@ -30,9 +30,17 @@ else ok "Container user IDs already set"; fi
 
 say "Step 3/6: Letting $U run background services without being logged in"
 sudo loginctl enable-linger "$U"
-sudo systemctl start "user@$UID_A.service" 2>/dev/null
-for _ in 1 2 3 4 5 6 7 8 9 10; do [ -S "$RUN/bus" ] && break; sleep 1; done
-[ -S "$RUN/bus" ] && ok "Background services ready" || { warn "User services didn't start (no $RUN/bus)."; exit 1; }
+sudo systemctl restart "user@$UID_A.service" 2>/dev/null || sudo systemctl start "user@$UID_A.service" 2>/dev/null
+for _ in $(seq 1 20); do
+  [ -S "$RUN/bus" ] && break
+  sudo -u "$U" XDG_RUNTIME_DIR="$RUN" systemctl --user start dbus.socket >/dev/null 2>&1
+  sleep 1
+done
+if [ -S "$RUN/bus" ]; then ok "Background services ready"; else
+  warn "User services didn't start (no $RUN/bus). Details:"
+  systemctl status "user@$UID_A.service" --no-pager 2>&1 | tail -n 8
+  ls -la "$RUN" 2>&1 | head; exit 1
+fi
 
 say "Step 4/6: Installing the private Docker"
 if command -v dockerd-rootless-setuptool.sh >/dev/null; then
