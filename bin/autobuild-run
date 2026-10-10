@@ -144,6 +144,15 @@ if [ "$kind" = "existing" ]; then
 
 $(sed -e "s#{{PLAN}}#$P#g" -e "s#{{META}}#$M#g" -e "s#{{BRANCH}}#$branch#g" "$AB_HOME/templates/EXISTING-RULES.md")"
 fi
+ab_context "$slug" > "$meta/background.txt"
+if [ -s "$meta/background.txt" ]; then
+  rules="$rules
+
+## Project background
+Damen's settled decisions and context from his ChatGPT project are in $M/background.txt. Read it once at the
+start of each round. If it conflicts with the plan, the plan wins; ask GPT if unsure."
+  act "📚 Using project background from ChatGPT ($(wc -c < "$meta/background.txt") characters)"
+fi
 export AB_PROJECT_DIR="$dir"
 
 # Save the work where Damen can get it (and push the branch for GitHub projects)
