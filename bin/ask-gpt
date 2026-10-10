@@ -22,8 +22,12 @@ if [ "$count" -ge "$AB_MAX_GPT_QUESTIONS" ]; then
 fi
 echo $((count + 1)) > "$meta/gpt-count"
 
+slug=$(basename "$dir")
 prompt="You are the product architect for this project. You designed it with Damen in ChatGPT.
 A builder (Claude Code) is building it unattended and has a question. Damen is NOT available.
+
+=== PROJECT BACKGROUND (from Damen's ChatGPT project - treat as his settled decisions) ===
+$(ab_context "$slug" 2>/dev/null)
 
 === THE PLAN (PLAN.md) ===
 $(cat "$dir/PLAN.md" 2>/dev/null)
