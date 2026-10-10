@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+# When a build stops for Damen, GPT writes a proposed next step he can approve with one click
+# on the Watch page.
+#   ab-propose <project> ["Damen's note asking for changes"]
+# Writes .autobuild/PROPOSED.md (shown on the Watch page) and .autobuild/proposed-plan.txt (the plan
+# that runs if he clicks Approve). GPT runs read-only via Damen's ChatGPT subscription.
+set -uo pipefail
+source "$(dirname "$0")/ab-common.sh"
+
+slug="$1"; note="${2:-}"
+dir="$AB_PROJECTS/$slug"
+meta="$dir/.autobuild"
+work="$dir"; [ -d "$dir/code/.git" ] && work="$dir/code"
+act() { echo "[$(date +%H:%M:%S)] $*" >> "$meta/activity.log"; }
+touch "$meta/proposed-tried"
+
+act "🧠 GPT is writing a proposed next step for you to approve"
+ab_sync_out "$slug"
+prompt="You are the architect for this project. Damen (the owner, not technical) will read your proposal on a web page
+and either click APPROVE (the plan below then runs automatically, unattended, by a builder - Claude Code) or ask for changes.
+
+=== CURRENT PLAN ===
+$(cat "$dir/PLAN.md" 2>/dev/null)
+
+=== BUILDER'S REPORT ===
+$(tail -c 12000 "$meta/REPORT.md" 2>/dev/null || echo '(no report)')
+
+=== WHY IT STOPPED / WHAT IT NEEDS FROM DAMEN ===
+$(cat "$meta/NEXT-STEPS.md" 2>/dev/null)
+
+=== STATUS / RECENT REVIEW ===
+$(tail -c 3000 "$meta/status.md" 2>/dev/null)
+$(tail -c 3000 "$meta/reviews.md" 2>/dev/null)
+$( [ -n "$note" ] && printf '\n=== DAMEN ASKED FOR CHANGES TO YOUR LAST PROPOSAL ===\n%s\n=== HIS EARLIER PROPOSAL ===\n%s\n' "$note" "$(cat "$meta/PROPOSED.md" 2>/dev/null)")
+
+You may read the code in this folder. Do NOT change anything.
+
+Propose the single best next step. Rules:
+- The plan must be work the builder can do alone on this server (it has a private Docker for disposable test
+  containers/databases, and can ask you questions). Keep it focused: one phase.
+- Things only Damen can physically do (fixing billing, entering passwords/API keys, signing up, deploying, merging)
+  must NOT be in the plan; list them under WAITING ON DAMEN as things he does himself.
+- If a decision is needed (e.g. accept a local test run instead of CI, accept a small risk), make your
+  recommendation and list it under APPROVING MEANS so clicking Approve makes that decision.
+- Copy every boundary from the current plan. Never loosen one unless it is listed under APPROVING MEANS.
+- Plain English for Damen everywhere outside the plan.
+
+Reply in EXACTLY this format:
+SUMMARY: <2-3 plain sentences: where things are and what you propose>
+WAITING ON DAMEN:
+- <thing only he can do, or 'Nothing - just approve.'>
+APPROVING MEANS:
+- <each decision he makes by clicking Approve, or 'Nothing beyond running the plan.'>
+---PLAN---
+# <short title>
+## Goal
+## Tasks (numbered, specific)
+## Definition of done
+## Boundaries"
+
+out=$(mktemp)
+timeout "${AB_GPT_TIMEOUT:-600}" codex exec --sandbox read-only --skip-git-repo-check -C "$work" -o "$out" "$prompt" >> "$meta/codex.log" 2>&1
+reply=$(cat "$out" 2>/dev/null); rm -f "$out"
+plan_body=$(printf '%s\n' "$reply" | sed -n '/^---PLAN---/,$p' | sed '1d')
+if [ -z "$(echo "$plan_body" | tr -d '[:space:]')" ]; then
+  act "⚠️ GPT couldn't write a proposal (it may have hit the ChatGPT limit) - use ChatGPT for the next plan"
+  ab_sync_out "$slug"; exit 1
+fi
+section() { printf '%s\n' "$reply" | sed -n "/^$1/,/^\(WAITING ON DAMEN:\|APPROVING MEANS:\|---PLAN---\)/p" | sed '1d;$d'; }
+summary=$(printf '%s\n' "$reply" | sed -n '/^SUMMARY:/,/^WAITING ON DAMEN:/p' | sed '$d' | sed 's/^SUMMARY:[[:space:]]*//')
+printf '%s\n' "$plan_body" > "$meta/proposed-plan.txt"
+section "APPROVING MEANS:" > "$meta/proposed-approves.txt"
+{
+  echo "# Proposed next step"
+  echo
+  echo "$summary"
+  echo
+  echo "## Waiting on you"
+  section "WAITING ON DAMEN:"
+  echo
+  echo "## By clicking Approve you agree to"
+  cat "$meta/proposed-approves.txt"
+  echo
+  echo "---"
+  echo
+  echo "## The plan that will run"
+  echo
+  printf '%s\n' "$plan_body" | sed -E 's/^#[[:space:]]+(.*)$/### \1/; s/^##[[:space:]]+(.*)$/**\1**/'
+} > "$meta/PROPOSED.md"
+act "📋 Proposed next step ready - approve it on the Watch page"
+ab_sync_out "$slug"
+ab_notify "AutoBuild: $slug - next step ready" "GPT proposed the next step. Open the Watch page to approve it or ask for changes." high
+exit 0

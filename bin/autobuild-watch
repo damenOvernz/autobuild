@@ -2,6 +2,8 @@
 # Runs every 2 minutes (cron). Looks in Google Drive for:
 #   1. New plans in AutoBuild/inbox/  -> starts a build
 #   2. answer.md in AutoBuild/projects/<name>/ for a project waiting on Damen -> resumes it
+#   3. approve.md / revise.md (from the Watch page's buttons) -> runs GPT's proposed next step / asks GPT to change it
+#   4. A finished project with no proposed next step yet -> asks GPT for one
 set -uo pipefail
 source "$(dirname "$0")/ab-common.sh"
 mkdir -p "$AB_PROJECTS"
@@ -36,9 +38,62 @@ for d in "$AB_PROJECTS"/*/; do
   fi
 done
 
-# 2. New plans
+# 2. One-click approvals from the Watch page (or a request to change the proposal)
+for d in "$AB_PROJECTS"/*/; do
+  [ -d "$d" ] || continue
+  slug=$(basename "$d"); m="$d.autobuild"
+  [ -f "$m/proposed-plan.txt" ] || continue
+  case "$(ab_state "$slug")" in done|stopped|waiting|crashed) ;; *) continue ;; esac
+  have=$(rclone lsf "$AB_REMOTE/projects/$slug" --files-only 2>/dev/null)
+  ts=$(date +%Y%m%d-%H%M%S)
+  if printf '%s\n' "$have" | grep -qx "approve.md"; then
+    rclone copyto "$AB_REMOTE/projects/$slug/approve.md" "$m/approve-note.md" || continue
+    rclone moveto "$AB_REMOTE/projects/$slug/approve.md" "$AB_REMOTE/projects/$slug/approved-$ts.md" || true
+    header=""
+    for k in repo base branch phases; do v=$(ab_plan_field "$d" "$k"); [ -n "$v" ] && header="$header$k: $v
+"; done
+    cp "$d/PLAN.md" "$m/PLAN-previous-$ts.md" 2>/dev/null
+    {
+      [ -n "$header" ] && printf -- '---\n%s---\n\n' "$header"
+      cat "$m/proposed-plan.txt"; echo
+      echo "## Damen's approval ($(date '+%Y-%m-%d %H:%M'))"
+      echo "Damen approved this plan on the AutoBuild Watch page. By approving he agreed to:"
+      cat "$m/proposed-approves.txt" 2>/dev/null; echo
+      echo "His note (if any):"
+      grep -v '^[[:space:]]*$' "$m/approve-note.md" 2>/dev/null
+    } > "$d/PLAN.md"
+    rm -f "$m/DONE" "$m/NEXT-STEPS.md" "$m/PROPOSED.md" "$m/proposed-plan.txt" "$m/proposed-approves.txt" \
+          "$m/proposed-tried" "$m/approve-note.md" "$m/NEEDS_DAMEN.md" "$m/gpt-count"
+    echo "updated-plan" > "$m/mode"
+    echo "[$(date +%H:%M:%S)] 👍 Damen approved the proposed next step" >> "$m/activity.log"
+    ab_log "Approved next step for $slug - starting"
+    start_run "$slug"
+    exit 0
+  fi
+  if printf '%s\n' "$have" | grep -qx "revise.md"; then
+    rclone copyto "$AB_REMOTE/projects/$slug/revise.md" "$m/revise-note.txt" || continue
+    rclone moveto "$AB_REMOTE/projects/$slug/revise.md" "$AB_REMOTE/projects/$slug/revised-$ts.md" || true
+    echo "[$(date +%H:%M:%S)] ✏️ Damen asked for changes to the proposal" >> "$m/activity.log"
+    bash "$AB_HOME/bin/ab-propose" "$slug" "$(cat "$m/revise-note.txt")"
+    exit 0
+  fi
+done
+
+# 3. New plans
 plan=$(rclone lsf "$AB_REMOTE/inbox" --files-only 2>/dev/null | grep -i '\.md$' | head -n1 || true)
-[ -z "$plan" ] && exit 0
+if [ -z "$plan" ]; then
+  # 4. Nothing new: make sure every recently finished project has a proposed next step to approve
+  for d in "$AB_PROJECTS"/*/; do
+    [ -d "$d" ] || continue
+    slug=$(basename "$d"); m="$d.autobuild"
+    [ "$(ab_state "$slug")" = "done" ] || continue
+    [ -f "$m/proposed-plan.txt" ] || [ -f "$m/proposed-tried" ] && continue
+    [ -n "$(find "$m/NEXT-STEPS.md" -mtime -3 2>/dev/null)" ] || continue
+    bash "$AB_HOME/bin/ab-propose" "$slug"
+    exit 0
+  done
+  exit 0
+fi
 
 slug=$(ab_slug "$plan")
 if [ -d "$AB_PROJECTS/$slug" ]; then

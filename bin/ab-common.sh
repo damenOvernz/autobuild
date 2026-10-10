@@ -63,7 +63,19 @@ ab_sync_out() {
   fi
   rclone copy "$AB_PROJECTS/$slug/.autobuild" "$AB_REMOTE/projects/$slug" \
     --include "*.md" --include "state" >/dev/null 2>&1 || true
-  # Remove an old question from Drive once it's been answered
-  [ -f "$AB_PROJECTS/$slug/.autobuild/NEEDS_DAMEN.md" ] || \
-    rclone deletefile "$AB_REMOTE/projects/$slug/NEEDS_DAMEN.md" >/dev/null 2>&1 || true
+  # Remove old questions/proposals from Drive once they're dealt with
+  local f have
+  have=$(rclone lsf "$AB_REMOTE/projects/$slug" --files-only 2>/dev/null)
+  for f in NEEDS_DAMEN.md PROPOSED.md NEXT-STEPS.md; do
+    printf '%s\n' "$have" | grep -qx "$f" && [ ! -f "$m/$f" ] && \
+      rclone deletefile "$AB_REMOTE/projects/$slug/$f" >/dev/null 2>&1
+  done
+  return 0
+}
+
+ab_plan_field() { # ab_plan_field <project-dir> <key>: tolerant reader for the plan header (repo:, base: ...)
+  sed -n '1,40p' "$1/PLAN.md" 2>/dev/null | tr -d '\r' | sed -E 's/\*\*//g' \
+    | grep -m1 -iE "^[[:space:]#>*_\`-]*$2:[[:space:]]*[^[:space:]]" \
+    | sed -E "s/^[[:space:]#>*_\`-]*$2:[[:space:]]*//I; s/[[:space:]]+#.*$//; s/^[\"'\`<]//; s/[\"'\`>][[:space:]]*$//" \
+    | sed -E 's/^\[[^]]*\]\(([^)]*)\).*/\1/; s/^\[([^]]*)\].*/\1/; s/^[<]//; s/[>]$//'
 }
