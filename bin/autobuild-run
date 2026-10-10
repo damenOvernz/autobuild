@@ -40,7 +40,8 @@ plan_field() {
   # tolerant: accepts "repo: x", "### repo: x", "- **repo:** x", "> repo: x"
   sed -n '1,40p' "$dir/PLAN.md" | tr -d '\r' | sed -E 's/\*\*//g' \
     | grep -m1 -iE "^[[:space:]#>*_\`-]*$1:[[:space:]]*[^[:space:]]" \
-    | sed -E "s/^[[:space:]#>*_\`-]*$1:[[:space:]]*//I; s/[[:space:]]+#.*$//; s/^[\"'\`<]//; s/[\"'\`>][[:space:]]*$//"
+    | sed -E "s/^[[:space:]#>*_\`-]*$1:[[:space:]]*//I; s/[[:space:]]+#.*$//; s/^[\"'\`<]//; s/[\"'\`>][[:space:]]*$//" \
+    | sed -E 's/^\[[^]]*\]\(([^)]*)\).*/\1/; s/^\[([^]]*)\].*/\1/; s/^[<]//; s/[>]$//'
 }
 repo=$(plan_field repo)
 base=$(plan_field base)
