@@ -20,7 +20,8 @@ stop_with() { # plain-English reason for Damen
 field() { # same tolerant header reader as the runner
   sed -n '1,40p' "$dir/PLAN.md" | tr -d '\r' | sed -E 's/\*\*//g' \
     | grep -m1 -iE "^[[:space:]#>*_\`-]*$1:[[:space:]]*[^[:space:]]" \
-    | sed -E "s/^[[:space:]#>*_\`-]*$1:[[:space:]]*//I; s/[[:space:]]+#.*$//; s/^[\"'\`<]//; s/[\"'\`>][[:space:]]*$//"
+    | sed -E "s/^[[:space:]#>*_\`-]*$1:[[:space:]]*//I; s/[[:space:]]+#.*$//; s/^[\"'\`<]//; s/[\"'\`>][[:space:]]*$//" \
+    | sed -E 's/^\[[^]]*\]\(([^)]*)\).*/\1/; s/^\[([^]]*)\].*/\1/; s/^[<]//; s/[>]$//'
 }
 
 phase=$(cat "$meta/phase" 2>/dev/null || echo 1)

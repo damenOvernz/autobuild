@@ -6,6 +6,7 @@
 #   autobuild test-ping       - send a test notification to your phone
 #   autobuild check           - check Drive now (instead of waiting 2 minutes)
 #   autobuild github-login    - let AutoBuild read/write your GitHub repos (paste a token once)
+#   autobuild resume <name>   - carry on a paused/stopped build (same as saving answer.md in Drive)
 set -uo pipefail
 source "$(dirname "$0")/ab-common.sh"
 
@@ -35,6 +36,15 @@ case "${1:-status}" in
   test-ping)
     ab_notify "AutoBuild test" "If you can read this, phone pings are working." high
     echo "Test ping sent to topic: $AB_NTFY_TOPIC" ;;
+  resume)
+    slug="${2:?Usage: autobuild resume <project-name>}"
+    m="$AB_PROJECTS/$slug/.autobuild"
+    [ -f "$AB_PROJECTS/$slug/PLAN.md" ] || { echo "No project called $slug (see: autobuild status)"; exit 1; }
+    ab_any_running && { echo "Another build is running - try again when it finishes."; exit 1; }
+    rm -f "$m/NEEDS_DAMEN.md"; ab_set_state "$slug" running
+    nohup setsid "$AB_HOME/bin/autobuild-run" "$slug" >> "$m/run.log" 2>&1 < /dev/null &
+    echo $! > "$m/pid"
+    echo "Resumed $slug - watch it on the Watch page." ;;
   check)
     "$AB_HOME/bin/autobuild-watch"; echo "Checked Drive." ;;
   github-login)
@@ -56,5 +66,5 @@ EOT
     umask 077; printf 'https://%s:%s@github.com\n' "$login" "$tok" > "$HOME/.git-credentials"
     echo "OK: AutoBuild can now use GitHub as $login (only the repos you picked)." ;;
   *)
-    sed -n '2,9p' "$0" ;;
+    sed -n '2,10p' "$0" ;;
 esac
