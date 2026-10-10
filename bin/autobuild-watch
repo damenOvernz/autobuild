@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# Runs every 2 minutes (cron). Looks in Google Drive for:
+#   1. New plans in AutoBuild/inbox/  -> starts a build
+#   2. answer.md in AutoBuild/projects/<name>/ for a project waiting on Damen -> resumes it
+set -uo pipefail
+source "$(dirname "$0")/ab-common.sh"
+mkdir -p "$AB_PROJECTS"
+
+exec 9>"$AB_HOME/.watch.lock"
+flock -n 9 || exit 0
+
+start_run() { # start a build in the background, fully detached from this script
+  local slug="$1"
+  mkdir -p "$AB_PROJECTS/$slug/.autobuild"
+  ab_set_state "$slug" running
+  nohup setsid "$AB_HOME/bin/autobuild-run" "$slug" \
+    >> "$AB_PROJECTS/$slug/.autobuild/run.log" 2>&1 9>&- < /dev/null &
+  echo $! > "$AB_PROJECTS/$slug/.autobuild/pid"
+}
+
+# Only one build at a time, so you don't burn through usage limits
+ab_any_running && exit 0
+
+# 1. Answers from Damen for waiting projects (these go first)
+for d in "$AB_PROJECTS"/*/; do
+  [ -d "$d" ] || continue
+  slug=$(basename "$d")
+  [ "$(ab_state "$slug")" = "waiting" ] || continue
+  if rclone lsf "$AB_REMOTE/projects/$slug" --files-only 2>/dev/null | grep -qx "answer.md"; then
+    ts=$(date +%Y%m%d-%H%M%S)
+    rclone copyto "$AB_REMOTE/projects/$slug/answer.md" "$d.autobuild/answer.md" || continue
+    rclone moveto "$AB_REMOTE/projects/$slug/answer.md" "$AB_REMOTE/projects/$slug/answered-$ts.md" || true
+    ab_log "Answer received for $slug - resuming"
+    start_run "$slug"
+    exit 0
+  fi
+done
+
+# 2. New plans
+plan=$(rclone lsf "$AB_REMOTE/inbox" --files-only 2>/dev/null | grep -i '\.md$' | head -n1 || true)
+[ -z "$plan" ] && exit 0
+
+slug=$(ab_slug "$plan")
+if [ -d "$AB_PROJECTS/$slug" ]; then
+  # Same name as an earlier project: treat it as an updated plan for that project
+  if [ "$(ab_state "$slug")" = "running" ]; then exit 0; fi
+  cp "$AB_PROJECTS/$slug/PLAN.md" "$AB_PROJECTS/$slug/.autobuild/PLAN-previous-$(date +%Y%m%d-%H%M%S).md" 2>/dev/null || true
+  rm -f "$AB_PROJECTS/$slug/.autobuild/DONE"
+  echo "updated-plan" > "$AB_PROJECTS/$slug/.autobuild/mode"
+fi
+mkdir -p "$AB_PROJECTS/$slug/.autobuild"
+if rclone copyto "$AB_REMOTE/inbox/$plan" "$AB_PROJECTS/$slug/PLAN.md"; then
+  rclone moveto "$AB_REMOTE/inbox/$plan" "$AB_REMOTE/inbox/started/$(date +%Y%m%d-%H%M)-$plan" || true
+  ab_log "New plan '$plan' -> project $slug"
+  start_run "$slug"
+fi

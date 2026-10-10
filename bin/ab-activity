@@ -1,0 +1,67 @@
+#!/usr/bin/env python3
+"""Turns Claude Code's live event stream into plain-English activity lines.
+Reads stream-json on stdin, prints one short line per step (flushes each line)."""
+import json, sys, time, os
+
+def short(s, n=140):
+    s = " ".join(str(s).split())
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+def rel(p):
+    d = os.environ.get("AB_PROJECT_DIR", "")
+    p = str(p)
+    return p[len(d) + 1:] if d and p.startswith(d + "/") else p
+
+def describe(name, inp):
+    inp = inp or {}
+    if name == "Bash":
+        cmd = inp.get("command", "")
+        if cmd.strip().startswith("ask-gpt"):
+            return "🤖 Asking GPT: " + short(cmd.strip()[7:].strip(" '\""), 160)
+        return "⚙️ Running: " + short(inp.get("description") or cmd)
+    if name == "Write":
+        return "📝 Creating file: " + rel(inp.get("file_path", ""))
+    if name in ("Edit", "MultiEdit"):
+        return "✏️ Editing file: " + rel(inp.get("file_path", ""))
+    if name == "Read":
+        return "📖 Reading: " + rel(inp.get("file_path", ""))
+    if name in ("Glob", "Grep"):
+        return "🔎 Searching: " + short(inp.get("pattern", ""))
+    if name == "WebSearch":
+        return "🌐 Web search: " + short(inp.get("query", ""))
+    if name == "WebFetch":
+        return "🌐 Reading web page: " + short(inp.get("url", ""))
+    if name in ("TodoWrite", "TaskCreate", "TaskUpdate"):
+        return "🗒️ Updating its to-do list"
+    if name in ("Task", "Agent"):
+        return "👥 Starting a helper: " + short(inp.get("description", ""))
+    return "🔧 " + name
+
+def out(line):
+    sys.stdout.write("[" + time.strftime("%H:%M:%S") + "] " + line + "\n")
+    sys.stdout.flush()
+
+for raw in sys.stdin:
+    raw = raw.strip()
+    if not raw:
+        continue
+    try:
+        ev = json.loads(raw)
+    except ValueError:
+        out("ℹ️ " + short(raw))
+        continue
+    t = ev.get("type")
+    if t == "system" and ev.get("subtype") == "init":
+        out("▶️ Work session started")
+    elif t == "assistant":
+        for block in (ev.get("message") or {}).get("content") or []:
+            if block.get("type") == "text" and block.get("text", "").strip():
+                out("💬 " + short(block["text"], 200))
+            elif block.get("type") == "tool_use":
+                out(describe(block.get("name", ""), block.get("input")))
+    elif t == "result":
+        if ev.get("is_error") or ev.get("subtype", "success") != "success":
+            out("⚠️ Session ended early: " + short(ev.get("result") or ev.get("subtype", ""), 200))
+        else:
+            mins = round((ev.get("duration_ms") or 0) / 60000, 1)
+            out("⏹️ Work session finished (" + str(mins) + " min)")
