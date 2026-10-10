@@ -49,6 +49,9 @@ stat=$( [ -n "$start" ] && git -C "$work" diff --stat "$start..HEAD" 2>/dev/null
 prompt="You are the architect and reviewer for this project. Damen is not technical and is NOT available.
 A builder (Claude Code) has just finished phase $phase of $max. Review the evidence and decide what happens next.
 
+=== PROJECT BACKGROUND (from Damen's ChatGPT project - treat as his settled decisions) ===
+$(ab_context "$slug" 2>/dev/null)
+
 === PLAN FOR THE PHASE JUST FINISHED ===
 $(cat "$dir/PLAN.md")
 

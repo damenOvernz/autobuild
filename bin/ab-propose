@@ -19,6 +19,9 @@ ab_sync_out "$slug"
 prompt="You are the architect for this project. Damen (the owner, not technical) will read your proposal on a web page
 and either click APPROVE (the plan below then runs automatically, unattended, by a builder - Claude Code) or ask for changes.
 
+=== PROJECT BACKGROUND (from Damen's ChatGPT project - treat as his settled decisions) ===
+$(ab_context "$slug" 2>/dev/null)
+
 === CURRENT PLAN ===
 $(cat "$dir/PLAN.md" 2>/dev/null)
 
