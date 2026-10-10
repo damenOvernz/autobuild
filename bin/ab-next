@@ -14,6 +14,7 @@ act() { echo "[$(date +%H:%M:%S)] $*" >> "$meta/activity.log"; }
 stop_with() { # plain-English reason for Damen
   { echo "# Stopped after phase $phase - what happens next is up to you"; echo; echo "$1"; } > "$meta/NEXT-STEPS.md"
   act "⏹️ Auto-next stopped: $(echo "$1" | head -n1 | cut -c1-140)"
+  bash "$AB_HOME/bin/ab-propose" "$slug" >/dev/null 2>&1   # one-click next step for the Watch page
   exit 1
 }
 
