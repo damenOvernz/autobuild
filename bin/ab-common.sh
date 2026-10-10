@@ -79,3 +79,30 @@ ab_plan_field() { # ab_plan_field <project-dir> <key>: tolerant reader for the p
     | sed -E "s/^[[:space:]#>*_\`-]*$2:[[:space:]]*//I; s/[[:space:]]+#.*$//; s/^[\"'\`<]//; s/[\"'\`>][[:space:]]*$//" \
     | sed -E 's/^\[[^]]*\]\(([^)]*)\).*/\1/; s/^\[([^]]*)\].*/\1/; s/^[<]//; s/[>]$//'
 }
+
+# Project background saved by ChatGPT in Drive > AutoBuild > context (so the server's GPT knows what your
+# ChatGPT project knows). A file is used for a project when the plan names it ("context: prometheus") or a
+# word of its name (4+ letters) is part of the project name - e.g. prometheus-promie.md -> promie-p1-1.
+# Files called general.md / all.md go to every project.
+ab_context() { # ab_context <project>  -> prints the background text (max ~24k characters)
+  local slug="$1" dir="$AB_PROJECTS/$1" cdir="$AB_HOME/context" f stem w n use named out=""
+  mkdir -p "$cdir"
+  rclone copy "$AB_REMOTE/context" "$cdir" --include "*.md" --include "*.txt" >/dev/null 2>&1 || true
+  named=$(ab_plan_field "$dir" context | tr '[:upper:]' '[:lower:]' | tr ',' ' ')
+  for f in "$cdir"/*.md "$cdir"/*.txt; do
+    [ -f "$f" ] || continue
+    stem=$(basename "${f%.*}" | tr '[:upper:]' '[:lower:]')
+    use=0
+    case "$stem" in general|all|_all|everything) use=1 ;; esac
+    for w in $named; do [ "$stem" = "$w" ] && use=1; done
+    for w in $(printf '%s' "$stem" | tr -c 'a-z0-9\n' ' '); do
+      [ ${#w} -ge 4 ] && printf -- '-%s-' "$slug" | grep -q -- "-$w" && use=1
+      for n in $named; do [ "$w" = "$n" ] && use=1; done
+    done
+    [ "$use" = 1 ] && out="$out
+--- $(basename "$f") ---
+$(cat "$f")
+"
+  done
+  printf '%s' "$out" | head -c 24000
+}
