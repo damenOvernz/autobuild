@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# Claude Code calls this when it has a question for GPT (the "architect").
+# Usage:  ask-gpt "your question"      (or pipe the question in)
+# Uses Codex in READ-ONLY mode, signed in with Damen's ChatGPT subscription.
+# Codex never edits anything - it only answers.
+set -uo pipefail
+source "$(dirname "$0")/ab-common.sh"
+
+dir="${AB_PROJECT_DIR:-$PWD}"
+meta="$dir/.autobuild"
+codedir="$dir"; [ -d "$dir/code/.git" ] && codedir="$dir/code"
+mkdir -p "$meta"
+
+q="$*"
+[ -z "$q" ] && q=$(cat)
+if [ -z "$q" ]; then echo "Usage: ask-gpt \"question\""; exit 1; fi
+
+count=$(cat "$meta/gpt-count" 2>/dev/null || echo 0)
+if [ "$count" -ge "$AB_MAX_GPT_QUESTIONS" ]; then
+  echo "GPT QUESTION LIMIT REACHED ($AB_MAX_GPT_QUESTIONS). Make the best decision yourself and log it in .autobuild/decisions.md. If it is a big or risky decision, write .autobuild/NEEDS_DAMEN.md and stop."
+  exit 0
+fi
+echo $((count + 1)) > "$meta/gpt-count"
+
+prompt="You are the product architect for this project. You designed it with Damen in ChatGPT.
+A builder (Claude Code) is building it unattended and has a question. Damen is NOT available.
+
+=== THE PLAN (PLAN.md) ===
+$(cat "$dir/PLAN.md" 2>/dev/null)
+
+=== DECISIONS MADE SO FAR (latest) ===
+$(tail -c 6000 "$meta/decisions.md" 2>/dev/null)
+
+=== CURRENT STATUS ===
+$(tail -c 3000 "$meta/status.md" 2>/dev/null)
+
+=== BUILDER'S QUESTION ===
+$q
+
+Instructions for your answer:
+- Answer decisively and briefly. Give one clear direction, not a menu of options.
+- Stay true to the plan's intent. Prefer the simplest choice that gets a working MVP.
+- You may look at the project files to answer, but do NOT change anything.
+- If the question involves spending money, real customer data, passwords/security, legal issues,
+  deleting things outside this project, or changes the plan in a big way, start your answer with
+  the word ESCALATE and say what Damen needs to decide."
+
+out=$(mktemp)
+timeout "$AB_GPT_TIMEOUT" codex exec \
+  --sandbox read-only \
+  --skip-git-repo-check \
+  -C "$codedir" \
+  -o "$out" \
+  "$prompt" >> "$meta/codex.log" 2>&1
+rc=$?
+answer=$(cat "$out" 2>/dev/null); rm -f "$out"
+
+if [ "$rc" -ne 0 ] || [ -z "$answer" ]; then
+  answer="GPT IS UNAVAILABLE right now (it may have hit the ChatGPT usage limit). Make the best decision yourself, consistent with the plan, and log it in your decisions file. If it is a big or risky decision, write NEEDS_DAMEN.md (in the AutoBuild notes folder) and stop."
+fi
+
+{
+  echo "## $(date '+%Y-%m-%d %H:%M') - Question $((count + 1))"
+  echo "**Claude Code asked:** $q"
+  echo
+  echo "**GPT answered:** $answer"
+  echo
+} >> "$meta/gpt-questions.md"
+
+echo "$answer"

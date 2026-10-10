@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# AutoBuild commands (run inside the locked-down 'autobuild' account).
+#   autobuild status          - list projects and what they're doing
+#   autobuild stop <name>     - stop a running build
+#   autobuild log <name>      - show the latest steps
+#   autobuild test-ping       - send a test notification to your phone
+#   autobuild check           - check Drive now (instead of waiting 2 minutes)
+#   autobuild github-login    - let AutoBuild read/write your GitHub repos (paste a token once)
+set -uo pipefail
+source "$(dirname "$0")/ab-common.sh"
+
+case "${1:-status}" in
+  status)
+    printf "%-32s %-9s %s\n" "PROJECT" "STATE" "WORKING ON"
+    for d in "$AB_PROJECTS"/*/; do
+      [ -d "$d" ] || continue
+      s=$(basename "$d"); where="new project"
+      [ -d "$d/code/.git" ] && where="branch $(git -C "$d/code" rev-parse --abbrev-ref HEAD 2>/dev/null)"
+      printf "%-32s %-9s %s\n" "$s" "$(ab_state "$s")" "$where"
+    done ;;
+  stop)
+    slug="${2:?Usage: autobuild stop <project-name>}"
+    pid=$(cat "$AB_PROJECTS/$slug/.autobuild/pid" 2>/dev/null || true)
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      kill -- "-$pid" 2>/dev/null || kill "$pid"
+      echo "Stopped $slug"
+    else
+      echo "$slug is not running"
+    fi
+    ab_set_state "$slug" stopped; rm -f "$AB_PROJECTS/$slug/.autobuild/pid" ;;
+  log)
+    slug="${2:?Usage: autobuild log <project-name>}"
+    tail -n 40 "$AB_PROJECTS/$slug/.autobuild/activity.log" 2>/dev/null \
+      || tail -n 60 "$AB_PROJECTS/$slug/.autobuild/claude-output.log" ;;
+  test-ping)
+    ab_notify "AutoBuild test" "If you can read this, phone pings are working." high
+    echo "Test ping sent to topic: $AB_NTFY_TOPIC" ;;
+  check)
+    "$AB_HOME/bin/autobuild-watch"; echo "Checked Drive." ;;
+  github-login)
+    cat <<'EOT'
+Create a GitHub token for AutoBuild (2 minutes):
+  1. Open  https://github.com/settings/personal-access-tokens/new
+  2. Name: AutoBuild    Expiration: 90 days (or your choice)
+  3. Repository access: "Only select repositories" -> pick the repos AutoBuild may work on
+  4. Permissions -> Repository permissions -> Contents: "Read and write"
+  5. Generate token, copy it.
+AutoBuild only ever pushes its own autobuild/... branches - never main, never merges.
+EOT
+    read -r -s -p "Paste the token here (it won't show) and press Enter: " tok; echo
+    [ -z "$tok" ] && { echo "No token entered."; exit 1; }
+    login=$(curl -fsS -m 20 -H "Authorization: Bearer $tok" https://api.github.com/user \
+      | python3 -c 'import sys,json; print(json.load(sys.stdin).get("login",""))' 2>/dev/null)
+    [ -z "$login" ] && { echo "!! GitHub didn't accept that token. Check you copied all of it and try again."; exit 1; }
+    git config --global credential.helper store
+    umask 077; printf 'https://%s:%s@github.com\n' "$login" "$tok" > "$HOME/.git-credentials"
+    echo "OK: AutoBuild can now use GitHub as $login (only the repos you picked)." ;;
+  *)
+    sed -n '2,9p' "$0" ;;
+esac
